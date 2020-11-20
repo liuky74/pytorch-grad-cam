@@ -37,16 +37,17 @@ class ModelOutputs():
     def __init__(self, model, feature_module, target_layers):
         self.model = model
         self.feature_module = feature_module
+        # 获取特定层的梯度
         self.feature_extractor = FeatureExtractor(self.feature_module, target_layers)
 
-    def get_gradients(self):
+    def get_gradients(self):#获取目标层梯度
         return self.feature_extractor.gradients
 
     def __call__(self, x):
         target_activations = []
         for name, module in self.model._modules.items():
             if module == self.feature_module:
-                target_activations, x = self.feature_extractor(x)
+                target_activations, x = self.feature_extractor(x) #取出指定层的输出target_activation 以及module本身的输出x
             elif "avgpool" in name.lower():
                 x = module(x)
                 x = x.view(x.size(0),-1)
@@ -55,7 +56,7 @@ class ModelOutputs():
         
         return target_activations, x
 
-
+# 预处理,包含归一化和permute等
 def preprocess_image(img):
     means = [0.485, 0.456, 0.406]
     stds = [0.229, 0.224, 0.225]
@@ -73,17 +74,17 @@ def preprocess_image(img):
 
 
 def show_cam_on_image(img, mask):
-    heatmap = cv2.applyColorMap(np.uint8(255 * mask), cv2.COLORMAP_JET)
+    heatmap = cv2.applyColorMap(np.uint8(255 * mask), cv2.COLORMAP_JET)  # 热力图化
     heatmap = np.float32(heatmap) / 255
-    cam = heatmap + np.float32(img)
-    cam = cam / np.max(cam)
+    cam = heatmap + np.float32(img)  # 与原图叠底
+    cam = cam / np.max(cam)  # 叠底后归一化
     cv2.imwrite("cam.jpg", np.uint8(255 * cam))
 
 
 class GradCam:
     def __init__(self, model, feature_module, target_layer_names, use_cuda):
-        self.model = model
-        self.feature_module = feature_module
+        self.model = model #需要查看热力图的模型
+        self.feature_module = feature_module # 需要参看热力图的子模块,target_layer_names会指定子模块中的具体层
         self.model.eval()
         self.cuda = use_cuda
         if self.cuda:
@@ -98,35 +99,35 @@ class GradCam:
         if self.cuda:
             features, output = self.extractor(input.cuda())
         else:
-            features, output = self.extractor(input)
-
+            features, output = self.extractor(input)  # 获取指定层的输出已经模型本身的输出
+        # 没有指定取哪一类时默认取分类值最高的那类
         if index == None:
             index = np.argmax(output.cpu().data.numpy())
-
+        # 独热化,建立一个mask取对应类的logit
         one_hot = np.zeros((1, output.size()[-1]), dtype=np.float32)
         one_hot[0][index] = 1
         one_hot = torch.from_numpy(one_hot).requires_grad_(True)
-        if self.cuda:
+        if self.cuda:  # 取出对应类的logit
             one_hot = torch.sum(one_hot.cuda() * output)
         else:
             one_hot = torch.sum(one_hot * output)
-
+        # 导数归零,开始反向求导
         self.feature_module.zero_grad()
         self.model.zero_grad()
-        one_hot.backward(retain_graph=True)
-
+        one_hot.backward(retain_graph=True)  # 反向求导的过程中钩子会将导数保留
+        # 取出指定层的导数
         grads_val = self.extractor.get_gradients()[-1].cpu().data.numpy()
-
+        # 取出指定层输出(即feature map)
         target = features[-1]
         target = target.cpu().data.numpy()[0, :]
-
+        # 计算导数在channel维度的均值
         weights = np.mean(grads_val, axis=(2, 3))[0, :]
         cam = np.zeros(target.shape[1:], dtype=np.float32)
-
+        "将指定层feature map逐个channel乘上导数均值后求和,最终会获得一个feature map大小的热力图," \
+        "这个图中包含了当前feature map每个像素下所有channel对指定分类的注意力"
         for i, w in enumerate(weights):
             cam += w * target[i, :, :]
-
-        cam = np.maximum(cam, 0)
+        cam = np.maximum(cam, 0)#类似clip操作,小于0的值全部变为0
         cam = cv2.resize(cam, input.shape[2:])
         cam = cam - np.min(cam)
         cam = cam / np.max(cam)
@@ -242,8 +243,11 @@ if __name__ == '__main__':
     # feature method, and a classifier method,
     # as in the VGG models in torchvision.
     model = models.resnet50(pretrained=True)
-    grad_cam = GradCam(model=model, feature_module=model.layer4, \
-                       target_layer_names=["2"], use_cuda=args.use_cuda)
+    grad_cam = GradCam(model=model, # 需要提取的模型
+                       feature_module=model.layer4,# 提取的特征层
+                       target_layer_names=["2"],
+                       use_cuda=args.use_cuda)
+
 
     img = cv2.imread(args.image_path, 1)
     img = np.float32(cv2.resize(img, (224, 224))) / 255
