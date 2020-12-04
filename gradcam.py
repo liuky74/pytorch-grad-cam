@@ -6,26 +6,28 @@ from torch.autograd import Function
 from torchvision import models
 
 class FeatureExtractor():
-    """ Class for extracting activations and 
-    registering gradients from targetted intermediate layers """
+    """ 这实质上是一个包装器,包装了传入的module对象,在调用call函数时除了正常的逐层前向传播外
+    还会勾出指定层的梯度,同时返回指定层的输出和整体block的输出"""
 
-    def __init__(self, model, target_layers):
+    def __init__(self, model,  # 参与热力图计算的block,torch.nn.Module类型
+                 target_layers # 具体的层名
+                 ):
         self.model = model
         self.target_layers = target_layers
         self.gradients = []
 
-    def save_gradient(self, grad):
+    def save_gradient(self, grad):  # 导数钩,保存中间运算时该层的梯度
         self.gradients.append(grad)
 
     def __call__(self, x):
         outputs = []
         self.gradients = []
-        for name, module in self.model._modules.items():
+        for name, module in self.model._modules.items():  # 循环执行block中的层,勾出的指定层的梯度
             x = module(x)
             if name in self.target_layers:
                 x.register_hook(self.save_gradient)
                 outputs += [x]
-        return outputs, x
+        return outputs, x  # 返回指定层的输出和整个block的输出
 
 
 class ModelOutputs():
@@ -33,21 +35,23 @@ class ModelOutputs():
     1. The network output.
     2. Activations from intermeddiate targetted layers.
     3. Gradients from intermeddiate targetted layers. """
-
-    def __init__(self, model, feature_module, target_layers):
+    def __init__(self, model,  # 整个模型
+                 feature_module,  # 进行热力图计算的block,注意这个对象是torch.nn.Module类型的
+                 target_layers  # 计算出热力图的具体层名, 字符串类型
+                 ):
         self.model = model
         self.feature_module = feature_module
-        # 获取特定层的梯度
+        # 传入block对象,建立钩子获取target_layers指定层的梯度
         self.feature_extractor = FeatureExtractor(self.feature_module, target_layers)
 
-    def get_gradients(self):#获取目标层梯度
+    def get_gradients(self):#获取指定层的梯度
         return self.feature_extractor.gradients
 
     def __call__(self, x):
         target_activations = []
         for name, module in self.model._modules.items():
-            if module == self.feature_module:
-                target_activations, x = self.feature_extractor(x) #取出指定层的输出target_activation 以及module本身的输出x
+            if module == self.feature_module:  # 当执行到指定block时调用包装类来勾出导数
+                target_activations, x = self.feature_extractor(x) #取出指定层的输出以及module本身的输出x
             elif "avgpool" in name.lower():
                 x = module(x)
                 x = x.view(x.size(0),-1)
@@ -82,14 +86,17 @@ def show_cam_on_image(img, mask):
 
 
 class GradCam:
-    def __init__(self, model, feature_module, target_layer_names, use_cuda):
+    def __init__(self, model,  # 完整的模型
+                 feature_module,  # 需要查看热力图的block,这个block中可能包含数个功能层
+                 target_layer_names,  # 具体用于生成热力图的层名
+                 use_cuda):
         self.model = model #需要查看热力图的模型
         self.feature_module = feature_module # 需要参看热力图的子模块,target_layer_names会指定子模块中的具体层
         self.model.eval()
         self.cuda = use_cuda
         if self.cuda:
             self.model = model.cuda()
-
+        # ModelOutputs会对模型进行包装,通过添加钩子和缓存对象保存指定层的梯度和输出
         self.extractor = ModelOutputs(self.model, self.feature_module, target_layer_names)
 
     def forward(self, input):
@@ -99,7 +106,7 @@ class GradCam:
         if self.cuda:
             features, output = self.extractor(input.cuda())
         else:
-            features, output = self.extractor(input)  # 获取指定层的输出已经模型本身的输出
+            features, output = self.extractor(input)  # 利用包装类的功能获取进行热力图计算的层输出,同时extractor中会使用钩子勾出该层的梯度并缓存
         # 没有指定取哪一类时默认取分类值最高的那类
         if index == None:
             index = np.argmax(output.cpu().data.numpy())
@@ -111,20 +118,24 @@ class GradCam:
             one_hot = torch.sum(one_hot.cuda() * output)
         else:
             one_hot = torch.sum(one_hot * output)
-        # 导数归零,开始反向求导
+        # 只对指定block进行导数归零,开始反向求导
         self.feature_module.zero_grad()
         self.model.zero_grad()
-        one_hot.backward(retain_graph=True)  # 反向求导的过程中钩子会将导数保留
-        # 取出指定层的导数
+        one_hot.backward(retain_graph=True)  # 反向求导的过程中self.extractor使用钩子会将导数保留
+        # 取出指定层的导数,shape = [batch_size,C,H,W],注意这个导数是对index类的导数
         grads_val = self.extractor.get_gradients()[-1].cpu().data.numpy()
         # 取出指定层输出(即feature map)
         target = features[-1]
+        # target shape = [bs,C,H,W]
         target = target.cpu().data.numpy()[0, :]
-        # 计算导数在channel维度的均值
+        # 计算每个channel下的导数均值,即每个channel对index类的梯度,shape = [C,]
         weights = np.mean(grads_val, axis=(2, 3))[0, :]
         cam = np.zeros(target.shape[1:], dtype=np.float32)
-        "将指定层feature map逐个channel乘上导数均值后求和,最终会获得一个feature map大小的热力图," \
-        "这个图中包含了当前feature map每个像素下所有channel对指定分类的注意力"
+        """
+        将指定层feature map逐个channel乘上梯度均值后求和,根据链式法则,diff*input即为Δw,因此这一步得到的结果可以
+        理解为对index这个分类,权重w的梯度在feature map上每个像素的分布,值越大代表该像素对index分类的影响力越大,
+        即对于index这个分类,模型应该关注那些像素,即注意力热力图.
+        """
         for i, w in enumerate(weights):
             cam += w * target[i, :, :]
         cam = np.maximum(cam, 0)#类似clip操作,小于0的值全部变为0
